@@ -13,6 +13,8 @@ const DEFAULT_ZOOM = 8;
 const DEFAULT_FILTERS = {
     search: "",
     minPower: 0,
+    maxPrice: 1.0,
+    onlyWithKnownPrice: false,
     adHocOnly: false,
     open24hOnly: false,
     connectorTypes: {
@@ -128,6 +130,16 @@ function extractPrice(props) {
   return stripHtml(match[1]).replace(/\s+/g, " ").trim();
 }
 
+function extractPricePerKwh(priceText) {
+  if (!priceText) return null;
+
+  const match = String(priceText).match(/(\d+(?:[.,]\d+)?)\s*CHF\s*\/\s*kWh/i);
+  if (!match) return null;
+
+  const value = Number(match[1].replace(",", "."));
+  return Number.isFinite(value) ? value : null;
+}
+
 function extractPowerKw(props) {
     const html = extractDescriptionHtml(props);
     if (!html) return 0;
@@ -210,6 +222,7 @@ function extractCity(props) {
 function normalizeStation(raw, index) {
     const props = raw?.properties ?? raw;
     const { lat, lng } = extractCoordinatePair(raw);
+    const price = extractPrice(props);
 
     return {
         id: props?.location_id ?? props?.id ?? props?.ID ?? raw?.id ?? `station-${index}`,
@@ -225,6 +238,7 @@ function normalizeStation(raw, index) {
         operator: extractFieldFromDescription(props, "Ladenetzwerk"),
         availability: props?.Availability || "",
         price: extractPrice(props),
+        pricePerKwh: extractPricePerKwh(price),
         raw: props,
     };
 }
@@ -441,7 +455,10 @@ export default function EVChargingSwitzerlandMap() {
             if (filters.adHocOnly && !station.adHocPayment) return false;
             if (filters.open24hOnly && !station.open24h) return false;
             if (station.powerKw < filters.minPower) return false;
-
+            if (filters.onlyWithKnownPrice && station.pricePerKwh == null) return false;
+            if (station.pricePerKwh != null && station.pricePerKwh > filters.maxPrice) {
+                return false;
+            }
             if (
                 activeConnectorTypes.length > 0 &&
                 station.connectorTypes.length > 0 &&
@@ -502,6 +519,42 @@ export default function EVChargingSwitzerlandMap() {
                                 style={{ width: "100%" }}
                             />
                         </div>
+
+                        <div style={styles.field}>
+                            <label style={styles.label}>
+                                Maximalpreis: {filters.maxPrice.toFixed(2)} CHF/kWh
+                            </label>
+                            <input
+                                type="range"
+                                min="0.20"
+                                max="1.20"
+                                step="0.01"
+                                value={filters.maxPrice}
+                                onChange={(e) =>
+                                    setFilters((prev) => ({ ...prev, maxPrice: Number(e.target.value) }))
+                                }
+                                style={{ width: "100%" }}
+                                 />
+                                 <div style={{ ...styles.smallText, marginTop: "6px" }}>
+                                    Zeigt Stationen bis zu diesem Preis pro kWh
+                                 </div>
+                        </div>
+
+<div style={styles.field}>
+  <label style={styles.checkboxRow}>
+    <input
+      type="checkbox"
+      checked={filters.onlyWithKnownPrice}
+      onChange={(e) =>
+        setFilters((prev) => ({
+          ...prev,
+          onlyWithKnownPrice: e.target.checked,
+        }))
+      }
+    />
+    Nur Stationen mit erkanntem Preis
+  </label>
+</div>
 
                         <div style={styles.field}>
                             <label style={styles.checkboxRow}>
@@ -600,9 +653,14 @@ export default function EVChargingSwitzerlandMap() {
                                                 <div style={{ fontWeight: 700, color: "#0f172a" }}>{displayName}</div>
                                                 <div style={{ ...styles.smallText, color: "#475569" }}>{displayLocation}</div>
                                                 
-                                                {station.price && (
+                                               {station.price && (
                                                     <div style={{ ...styles.smallText, marginTop: "4px", color: "#0f172a" }}>
                                                         Preis: {station.price}
+                                                        {station.pricePerKwh != null && (
+                                                            <span style={{ marginLeft: "6px", color: "#475569" }}>
+                                                                ({station.pricePerKwh.toFixed(2)} CHF/kWh)
+                                                            </span>
+                                                        )}
                                                     </div>
                                                 )}
                                                 <span style={styles.badge}>
