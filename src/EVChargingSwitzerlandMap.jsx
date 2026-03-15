@@ -298,16 +298,17 @@ const styles = {
     page: {
         minHeight: "100vh",
         background: "#f8fafc",
-        padding: "24px",
+        padding: "16px",
         fontFamily: "Arial, sans-serif",
         color: "#0f172a",
     },
     layout: {
-        maxWidth: "1400px",
+        maxWidth: "1800px",
         margin: "0 auto",
         display: "grid",
-        gridTemplateColumns: "380px 1fr",
+        gridTemplateColumns: "320px 1fr",
         gap: "24px",
+        alignItems: "start",
     },
     panel: {
         background: "white",
@@ -365,7 +366,7 @@ const styles = {
         color: "#334155",
     },
     resultList: {
-        maxHeight: "420px",
+        maxHeight: "340px",
         overflowY: "auto",
         marginTop: "12px",
     },
@@ -383,7 +384,8 @@ const styles = {
         WebkitAppearance: "none",
     },
     mapWrap: {
-        height: "620px",
+        height: "78vh",
+        minHeight: "700px",
         width: "100%",
     },
     button: {
