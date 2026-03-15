@@ -1,0 +1,645 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Slider } from "@/components/ui/slider";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Search, Zap, Filter, MapPin, Clock3, Cable } from "lucide-react";
+import {
+  MapContainer,
+  Marker,
+  Popup,
+  TileLayer,
+  useMap,
+} from "react-leaflet";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
+
+/**
+ * EV map for Switzerland with ad-hoc payment focus.
+ *
+ * Data sources documented by SFOE / ich-tanke-strom:
+ * - Static JSON (EVSEData)
+ * - Availability JSON (EVSEStatus)
+ * - GeoJSON aggregated by location
+ * - Feature API with CQL filters
+ *
+ * Sources:
+ * https://raw.githubusercontent.com/SFOE/ichtankestrom_Documentation/main/Access%20Download%20the%20data.md
+ * https://raw.githubusercontent.com/SFOE/ichtankestrom_Documentation/main/How%20to%20query%20ich%20tanke%20strom.md
+ */
+
+const GEOJSON_URL =
+  "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/data/ch.bfe.ladestellen-elektromobilitaet_de.json";
+
+const DEFAULT_CENTER = [46.8182, 8.2275]; // Switzerland
+const DEFAULT_ZOOM = 8;
+
+const DEFAULT_FILTERS = {
+  search: "",
+  minPower: 0,
+  adHocOnly: true,
+  open24hOnly: false,
+  connectorTypes: {
+    CCS: true,
+    Type2: true,
+    CHAdeMO: false,
+    Tesla: false,
+  },
+};
+
+const cityCoordinates = {
+  zürich: [47.3769, 8.5417],
+  zurich: [47.3769, 8.5417],
+  bern: [46.948, 7.4474],
+  basel: [47.5596, 7.5886],
+  luzern: [47.0502, 8.3093],
+  lucerne: [47.0502, 8.3093],
+  genf: [46.2044, 6.1432],
+  geneva: [46.2044, 6.1432],
+  lausanne: [46.5197, 6.6323],
+  winterthur: [47.4988, 8.7237],
+  st\. gallen: [47.4245, 9.3767],
+  lugano: [46.0037, 8.9511],
+};
+
+function getArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null) return [];
+  return [value];
+}
+
+function flattenStrings(input) {
+  if (input == null) return [];
+  if (typeof input === "string") return [input];
+  if (typeof input === "number" || typeof input === "boolean") {
+    return [String(input)];
+  }
+  if (Array.isArray(input)) return input.flatMap(flattenStrings);
+  if (typeof input === "object") {
+    return Object.values(input).flatMap(flattenStrings);
+  }
+  return [];
+}
+
+function extractCoordinatePair(raw) {
+  if (Array.isArray(raw?.geometry?.coordinates)) {
+    const [lng, lat] = raw.geometry.coordinates;
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      return { lat: Number(lat), lng: Number(lng) };
+    }
+  }
+
+  const lat = raw?.latitude ?? raw?.lat ?? raw?.Latitude ?? raw?.Lat;
+  const lng = raw?.longitude ?? raw?.lng ?? raw?.Longitude ?? raw?.Lng;
+
+  if (Number.isFinite(Number(lat)) && Number.isFinite(Number(lng))) {
+    return { lat: Number(lat), lng: Number(lng) };
+  }
+
+  const props = raw?.properties ?? raw;
+  const pLat = props?.latitude ?? props?.lat ?? props?.Latitude ?? props?.Lat;
+  const pLng = props?.longitude ?? props?.lng ?? props?.Longitude ?? props?.Lng;
+
+  if (Number.isFinite(Number(pLat)) && Number.isFinite(Number(pLng))) {
+    return { lat: Number(pLat), lng: Number(pLng) };
+  }
+
+  return { lat: NaN, lng: NaN };
+}
+
+function extractPowerKw(props) {
+  const directCandidates = [
+    props?.powerKw,
+    props?.Power,
+    props?.MaxPower,
+    props?.maxPowerKw,
+    props?.max_power_kw,
+  ];
+
+  for (const candidate of directCandidates) {
+    const n = Number(candidate);
+    if (Number.isFinite(n)) return n;
+  }
+
+  const chargingFacilities = getArray(props?.ChargingFacilities);
+  const facilityPowers = chargingFacilities
+    .map((facility) => Number(facility?.Power ?? facility?.power ?? facility?.PowerKW))
+    .filter(Number.isFinite);
+
+  if (facilityPowers.length > 0) {
+    return Math.max(...facilityPowers);
+  }
+
+  const allNumbers = flattenStrings(chargingFacilities)
+    .map((s) => Number(String(s).replace(/[^\d.]/g, "")))
+    .filter(Number.isFinite);
+
+  return allNumbers.length ? Math.max(...allNumbers) : 0;
+}
+
+function extractConnectorTypes(props) {
+  const facilities = getArray(props?.ChargingFacilities);
+  const plugs = [
+    ...flattenStrings(props?.Plugs),
+    ...facilities.flatMap((facility) => flattenStrings(facility?.Plugs ?? facility?.PlugType)),
+  ];
+
+  const normalized = new Set();
+
+  for (const plug of plugs) {
+    const lower = String(plug).toLowerCase();
+    if (lower.includes("ccs")) normalized.add("CCS");
+    if (lower.includes("type 2") || lower.includes("type2")) normalized.add("Type2");
+    if (lower.includes("chademo")) normalized.add("CHAdeMO");
+    if (lower.includes("tesla")) normalized.add("Tesla");
+  }
+
+  return [...normalized];
+}
+
+function extractAdHocPayment(props) {
+  const bag = [
+    props?.adHocPayment,
+    props?.AdHocPayment,
+    props?.IsAdHocPaymentPossible,
+    props?.isAdHocPaymentPossible,
+    props?.AuthMethods,
+    props?.AuthenticationModes,
+    props?.PaymentOptions,
+  ];
+
+  for (const candidate of bag) {
+    if (typeof candidate === "boolean") return candidate;
+  }
+
+  const text = flattenStrings(bag).join(" ").toLowerCase();
+  if (!text) return false;
+
+  return [
+    "ad hoc",
+    "adhoc",
+    "credit card",
+    "debit card",
+    "visa",
+    "mastercard",
+    "terminal",
+    "direct payment",
+    "app-free",
+  ].some((term) => text.includes(term));
+}
+
+function extractIsOpen24Hours(props) {
+  const direct = props?.IsOpen24Hours ?? props?.isOpen24Hours;
+  if (typeof direct === "boolean") return direct;
+  return false;
+}
+
+function extractStationName(props) {
+  const nameCandidates = [
+    props?.name,
+    props?.Name,
+    props?.operator,
+    props?.OperatorName,
+    props?.ChargingStationName,
+  ];
+
+  for (const candidate of nameCandidates) {
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+
+  const stationNames = getArray(props?.ChargingStationNames);
+  for (const entry of stationNames) {
+    if (typeof entry?.value === "string" && entry.value.trim()) return entry.value.trim();
+  }
+
+  return "Unbenannte Station";
+}
+
+function extractAddress(props) {
+  return (
+    props?.address ||
+    props?.Address ||
+    props?.street ||
+    props?.Street ||
+    props?.StreetAddress ||
+    ""
+  );
+}
+
+function extractCity(props) {
+  return props?.city || props?.City || props?.Town || props?.Municipality || "";
+}
+
+function normalizeStation(raw, index) {
+  const props = raw?.properties ?? raw;
+  const { lat, lng } = extractCoordinatePair(raw);
+
+  return {
+    id: props?.id ?? props?.ID ?? raw?.id ?? `station-${index}`,
+    name: extractStationName(props),
+    city: extractCity(props),
+    address: extractAddress(props),
+    lat,
+    lng,
+    powerKw: extractPowerKw(props),
+    adHocPayment: extractAdHocPayment(props),
+    open24h: extractIsOpen24Hours(props),
+    connectorTypes: extractConnectorTypes(props),
+    operator: props?.operator || props?.OperatorName || "",
+    raw: props,
+  };
+}
+
+function normalizeDataset(payload) {
+  if (Array.isArray(payload)) {
+    return payload.map(normalizeStation);
+  }
+
+  if (Array.isArray(payload?.features)) {
+    return payload.features.map(normalizeStation);
+  }
+
+  if (Array.isArray(payload?.items)) {
+    return payload.items.map(normalizeStation);
+  }
+
+  return [];
+}
+
+function powerBand(powerKw) {
+  if (powerKw >= 150) return "fast";
+  if (powerKw >= 50) return "medium";
+  return "slow";
+}
+
+function markerIcon(powerKw) {
+  const band = powerBand(powerKw);
+  const background =
+    band === "fast"
+      ? "#dc2626"
+      : band === "medium"
+        ? "#ea580c"
+        : "#2563eb";
+
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:18px;height:18px;border-radius:999px;background:${background};border:2px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.35)"></div>`,
+    iconSize: [18, 18],
+    iconAnchor: [9, 9],
+    popupAnchor: [0, -10],
+  });
+}
+
+function MapFlyTo({ center, zoom = 11 }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (center) map.flyTo(center, zoom, { duration: 0.8 });
+  }, [center, zoom, map]);
+
+  return null;
+}
+
+function getSearchCenter(search, filteredStations) {
+  const value = search.trim().toLowerCase();
+  if (!value) return null;
+
+  const firstStation = filteredStations.find((station) => {
+    const haystack = [station.name, station.city, station.address, station.operator]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(value);
+  });
+
+  if (firstStation) return [firstStation.lat, firstStation.lng];
+
+  return cityCoordinates[value] || null;
+}
+
+export default function EVChargingSwitzerlandMap() {
+  const [stations, setStations] = useState([]);
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [selectedStation, setSelectedStation] = useState(null);
+  const [mapTarget, setMapTarget] = useState(null);
+  const hasAppliedInitialTarget = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadStations() {
+      setLoading(true);
+      setError("");
+
+      try {
+        const response = await fetch(GEOJSON_URL);
+        if (!response.ok) {
+          throw new Error(`API-Fehler beim Laden der Stationen: ${response.status}`);
+        }
+
+        const payload = await response.json();
+        const normalized = normalizeDataset(payload).filter(
+          (station) => Number.isFinite(station.lat) && Number.isFinite(station.lng)
+        );
+
+        if (!cancelled) {
+          setStations(normalized);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Unbekannter Fehler beim Laden der Stationen"
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadStations();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const filteredStations = useMemo(() => {
+    const searchLower = filters.search.trim().toLowerCase();
+    const activeConnectorTypes = Object.entries(filters.connectorTypes)
+      .filter(([, enabled]) => enabled)
+      .map(([key]) => key);
+
+    return stations.filter((station) => {
+      if (filters.adHocOnly && !station.adHocPayment) return false;
+      if (filters.open24hOnly && !station.open24h) return false;
+      if (station.powerKw < filters.minPower) return false;
+
+      if (
+        activeConnectorTypes.length > 0 &&
+        !activeConnectorTypes.some((type) => station.connectorTypes.includes(type))
+      ) {
+        return false;
+      }
+
+      if (!searchLower) return true;
+
+      const haystack = [station.name, station.city, station.address, station.operator]
+        .join(" ")
+        .toLowerCase();
+
+      return haystack.includes(searchLower);
+    });
+  }, [stations, filters]);
+
+  useEffect(() => {
+    const center = getSearchCenter(filters.search, filteredStations);
+    if (center) setMapTarget(center);
+  }, [filters.search, filteredStations]);
+
+  useEffect(() => {
+    if (!hasAppliedInitialTarget.current && filteredStations.length > 0) {
+      hasAppliedInitialTarget.current = true;
+      setMapTarget([filteredStations[0].lat, filteredStations[0].lng]);
+    }
+  }, [filteredStations]);
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-6">
+      <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-[380px_1fr]">
+        <Card className="rounded-2xl shadow-sm">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-xl">
+              <Zap className="h-5 w-5" />
+              Ladestationen Schweiz
+            </CardTitle>
+          </CardHeader>
+
+          <CardContent className="space-y-6">
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Ort / Betreiber / Station suchen</label>
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                <Input
+                  className="pl-9"
+                  placeholder="z. B. Zürich, Bern, GOFAST"
+                  value={filters.search}
+                  onChange={(e) =>
+                    setFilters((prev) => ({ ...prev, search: e.target.value }))
+                  }
+                />
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Filter className="h-4 w-4" />
+                Mindest-Ladeleistung: {filters.minPower} kW
+              </div>
+              <Slider
+                min={0}
+                max={350}
+                step={10}
+                value={[filters.minPower]}
+                onValueChange={([value]) =>
+                  setFilters((prev) => ({ ...prev, minPower: value }))
+                }
+              />
+            </div>
+
+            <div className="space-y-3 rounded-xl border p-3">
+              <div className="flex items-center space-x-3">
+                <Checkbox
+                  id="adhoc"
+                  checked={filters.adHocOnly}
+                  onCheckedChange={(checked) =>
+                    setFilters((prev) => ({ ...prev, adHocOnly: Boolean(checked) }))
+                  }
+                />
+                <label htmlFor="adhoc" className="text-sm font-medium leading-none">
+                  Nur Ad-hoc-Bezahlung
+                </label>
+              </div>
+
+              <div className="flex items-center space-x-3">
+                <Checkbox
+                  id="open24"
+                  checked={filters.open24hOnly}
+                  onCheckedChange={(checked) =>
+                    setFilters((prev) => ({ ...prev, open24hOnly: Boolean(checked) }))
+                  }
+                />
+                <label htmlFor="open24" className="text-sm font-medium leading-none">
+                  Nur 24h geöffnet
+                </label>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Cable className="h-4 w-4" />
+                Steckertypen
+              </div>
+              {Object.entries(filters.connectorTypes).map(([type, checked]) => (
+                <div key={type} className="flex items-center space-x-3">
+                  <Checkbox
+                    id={type}
+                    checked={checked}
+                    onCheckedChange={(value) =>
+                      setFilters((prev) => ({
+                        ...prev,
+                        connectorTypes: {
+                          ...prev.connectorTypes,
+                          [type]: Boolean(value),
+                        },
+                      }))
+                    }
+                  />
+                  <label htmlFor={type} className="text-sm">
+                    {type}
+                  </label>
+                </div>
+              ))}
+            </div>
+
+            <div className="rounded-xl bg-slate-100 p-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span>{filteredStations.length} Treffer</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setFilters(DEFAULT_FILTERS);
+                    setMapTarget(DEFAULT_CENTER);
+                  }}
+                >
+                  Filter zurücksetzen
+                </Button>
+              </div>
+
+              <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-600">
+                <Badge variant="outline">Blau: bis 49 kW</Badge>
+                <Badge variant="outline">Orange: 50–149 kW</Badge>
+                <Badge variant="outline">Rot: ab 150 kW</Badge>
+              </div>
+            </div>
+
+            {loading && <p className="text-sm text-slate-500">Lade Stationen…</p>}
+            {error && <p className="text-sm text-red-600">{error}</p>}
+
+            <div className="max-h-[420px] space-y-3 overflow-auto pr-1">
+              {filteredStations.map((station) => (
+                <button
+                  key={station.id}
+                  onClick={() => {
+                    setSelectedStation(station);
+                    setMapTarget([station.lat, station.lng]);
+                  }}
+                  className="w-full rounded-2xl border bg-white p-4 text-left shadow-sm transition hover:border-slate-400"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="font-semibold">{station.name}</div>
+                      <div className="mt-1 flex items-center gap-1 text-sm text-slate-500">
+                        <MapPin className="h-4 w-4" />
+                        {station.city || "Ort unbekannt"}
+                      </div>
+                    </div>
+                    <Badge>{Math.round(station.powerKw)} kW</Badge>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {station.adHocPayment && <Badge variant="secondary">Ad-hoc</Badge>}
+                    {station.open24h && <Badge variant="secondary">24h</Badge>}
+                    {station.connectorTypes.map((type) => (
+                      <Badge key={type} variant="outline">
+                        {type}
+                      </Badge>
+                    ))}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="grid gap-6">
+          <Card className="rounded-2xl shadow-sm">
+            <CardHeader>
+              <CardTitle>Karte</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="overflow-hidden rounded-2xl border bg-white">
+                <MapContainer
+                  center={DEFAULT_CENTER}
+                  zoom={DEFAULT_ZOOM}
+                  scrollWheelZoom
+                  className="h-[620px] w-full"
+                >
+                  <TileLayer
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                  />
+
+                  {mapTarget && <MapFlyTo center={mapTarget} zoom={11} />}
+
+                  {filteredStations.map((station) => (
+                    <Marker
+                      key={station.id}
+                      position={[station.lat, station.lng]}
+                      icon={markerIcon(station.powerKw)}
+                      eventHandlers={{
+                        click: () => setSelectedStation(station),
+                      }}
+                    >
+                      <Popup>
+                        <div className="space-y-1 text-sm">
+                          <div className="font-semibold">{station.name}</div>
+                          <div>{station.city || "Ort unbekannt"}</div>
+                          <div>{station.address || ""}</div>
+                          <div>Leistung: {Math.round(station.powerKw)} kW</div>
+                          <div>Ad-hoc: {station.adHocPayment ? "Ja" : "Nein"}</div>
+                          {station.connectorTypes.length > 0 && (
+                            <div>Stecker: {station.connectorTypes.join(", ")}</div>
+                          )}
+                        </div>
+                      </Popup>
+                    </Marker>
+                  ))}
+                </MapContainer>
+              </div>
+            </CardContent>
+          </Card>
+
+          {selectedStation && (
+            <Card className="rounded-2xl shadow-sm">
+              <CardHeader>
+                <CardTitle>{selectedStation.name}</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 text-sm text-slate-700">
+                <p><strong>Ort:</strong> {selectedStation.city || "–"}</p>
+                <p><strong>Adresse:</strong> {selectedStation.address || "–"}</p>
+                <p><strong>Betreiber:</strong> {selectedStation.operator || "–"}</p>
+                <p><strong>Max. Leistung:</strong> {Math.round(selectedStation.powerKw)} kW</p>
+                <p><strong>Ad-hoc-Bezahlung:</strong> {selectedStation.adHocPayment ? "Ja" : "Nein"}</p>
+                <p><strong>24h geöffnet:</strong> {selectedStation.open24h ? "Ja" : "Nein"}</p>
+                <p><strong>Steckertypen:</strong> {selectedStation.connectorTypes.join(", ") || "–"}</p>
+                <p><strong>Koordinaten:</strong> {selectedStation.lat}, {selectedStation.lng}</p>
+                <p className="flex items-center gap-2 text-slate-500">
+                  <Clock3 className="h-4 w-4" />
+                  Tipp: Wenn einzelne Felder nicht sauber erkannt werden, passe die Adapterfunktionen oben an deine echten JSON-Felder an.
+                </p>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
