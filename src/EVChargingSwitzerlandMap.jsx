@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { MapContainer, Marker, Popup, TileLayer, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import MarkerClusterGroup from "react-leaflet-cluster";
 
 const GEOJSON_URL =
   "https://data.geo.admin.ch/ch.bfe.ladestellen-elektromobilitaet/data/ch.bfe.ladestellen-elektromobilitaet_de.json";
@@ -606,29 +607,39 @@ export default function EVChargingSwitzerlandMap() {
 
                 {mapTarget && <MapFlyTo center={mapTarget} zoom={11} />}
 
-                {filteredStations.map((station) => (
-                  <Marker
-                    key={station.id}
-                    position={[station.lat, station.lng]}
-                    icon={markerIcon(station.powerKw)}
-                    eventHandlers={{
-                      click: () => setSelectedStation(station),
-                    }}
-                  >
-                    <Popup>
-                      <div>
-                        <div style={{ fontWeight: 700 }}>{station.name}</div>
-                        <div>{station.city || "Ort unbekannt"}</div>
-                        <div>{station.address || ""}</div>
-                        <div>Leistung: {Math.round(station.powerKw)} kW</div>
-                        <div>Ad-hoc: {station.adHocPayment ? "Ja" : "Nein"}</div>
-                        {station.connectorTypes.length > 0 && (
-                          <div>Stecker: {station.connectorTypes.join(", ")}</div>
-                        )}
-                      </div>
-                    </Popup>
-                  </Marker>
-                ))}
+                <MarkerClusterGroup
+  chunkedLoading
+  maxClusterRadius={50}
+  spiderfyOnMaxZoom={true}
+  showCoverageOnHover={false}
+>
+  {filteredStations.map((station) => (
+    <Marker
+      key={station.id}
+      position={[station.lat, station.lng]}
+      icon={markerIcon(station.powerKw)}
+      eventHandlers={{
+        click: () => setSelectedStation(station),
+      }}
+    >
+      <Popup>
+        <div>
+          <div style={{ fontWeight: 700 }}>
+            {station.name || station.operator || station.id}
+          </div>
+          <div>{station.city || "Ort unbekannt"}</div>
+          <div>{station.address || ""}</div>
+          <div>Leistung: {Math.round(station.powerKw)} kW</div>
+          <div>Ad-hoc: {station.adHocPayment ? "Ja" : "Nein"}</div>
+          <div>Status: {station.availability || "Unbekannt"}</div>
+          {station.connectorTypes.length > 0 && (
+            <div>Stecker: {station.connectorTypes.join(", ")}</div>
+          )}
+        </div>
+      </Popup>
+    </Marker>
+  ))}
+</MarkerClusterGroup>
               </MapContainer>
             </div>
           </div>
